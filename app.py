@@ -1,36 +1,35 @@
 """
-MyReadingManga Raw Downloader - Optimized Engine
+MyReadingManga Auto-Bypass Downloader - Streamlit Web App
 """
 
 import io
 import re
 import zipfile
 from urllib.parse import urlparse
+import cloudscraper
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from curl_cffi import requests as cureq
 
 def sanitize_filename(name: str) -> str:
     clean = re.sub(r'[\\/*?:"<>|]', "", name).strip()
     return clean[:80] if clean else "MRM_Comic"
 
-def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tuple[list[str], str, list[str]]:
-    ua = custom_ua.strip() if custom_ua.strip() else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-        "Referer": "https://myreadingmanga.info/",
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-    }
-    if cookie_str.strip():
-        headers["Cookie"] = cookie_str.strip()
+def create_scraper_session():
+    """Khởi tạo scraper tự động vượt Cloudflare JS Challenge."""
+    return cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'darwin',
+            'desktop': True
+        },
+        delay=10
+    )
 
-    # Chuẩn hoá URL gốc (xóa pagination thừa)
+def fetch_mrm_images(first_page_url: str) -> tuple[list[str], str, list[str]]:
+    scraper = create_scraper_session()
+
+    # Chuẩn hoá URL bài viết
     base_url = re.sub(r'/\d+/?$', '/', first_page_url.strip())
     if not base_url.endswith("/"):
         base_url += "/"
@@ -41,19 +40,17 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
     comic_title = "MRM_Comic"
     current_page = 1
 
-    session = cureq.Session(impersonate="chrome124")
-
     while True:
         page_url = base_url if current_page == 1 else f"{base_url}{current_page}/"
         try:
-            r = session.get(page_url, headers=headers, timeout=25)
+            r = scraper.get(page_url, timeout=30)
             logs.append(f"Trang {current_page} [{page_url}] -> HTTP {r.status_code}")
-            
+
             if r.status_code in (403, 404):
                 if r.status_code == 403:
-                    logs.append("⚠️ Cloudflare chặn (403). Hãy cập nhật Cookie và User-Agent mới nhất.")
+                    logs.append("⚠️ Cloudflare chặn cứng IP máy chủ.")
                 break
-            
+
             html = r.text
         except Exception as e:
             logs.append(f"Lỗi kết nối trang {current_page}: {str(e)}")
@@ -75,10 +72,7 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
             break
 
         found_in_page = 0
-        img_tags = entry_content.select("img")
-
-        for img in img_tags:
-            # Quét tất cả các thuộc tính chứa link ảnh có thể có
+        for img in entry_content.select("img"):
             candidates = [
                 img.get("data-src"),
                 img.get("data-lazy-src"),
@@ -86,13 +80,12 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
                 img.get("data-original"),
                 img.get("src")
             ]
-            
-            # Quét thêm từ srcset nếu có
+
             srcset = img.get("srcset") or img.get("data-srcset")
             if srcset:
                 parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
                 if parts:
-                    candidates.insert(0, parts[-1]) # Lấy ảnh có độ phân giải cao nhất
+                    candidates.insert(0, parts[-1])
 
             src = None
             for c in candidates:
@@ -104,7 +97,6 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
                 if src.startswith("//"):
                     src = "https:" + src
                 if src.startswith("http") and src not in seen:
-                    # Bỏ các ảnh icon/quảng cáo nhỏ
                     if not any(bad in src.lower() for bad in ["banner", "ads", "icon", "placeholder"]):
                         seen.add(src)
                         all_images.append(src)
@@ -115,7 +107,6 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
         if found_in_page == 0:
             break
 
-        # Kiểm tra xem có trang tiếp theo không
         has_next = soup.select(".entry-pagination, .post-page-numbers, .pagination, a[href*='/" + str(current_page + 1) + "/']")
         if not has_next:
             break
@@ -126,53 +117,35 @@ def fetch_mrm_images(first_page_url: str, cookie_str: str, custom_ua: str) -> tu
 
 # --- GIAO DIỆN STREAMLIT ---
 st.set_page_config(page_title="MyReadingManga Downloader", page_icon="📖", layout="centered")
-st.title("📖 MyReadingManga Raw Downloader")
+st.title("📖 MyReadingManga Downloader (Auto Bypass)")
 
 url_input = st.text_input(
     "👉 Nhập link bài viết (URL):", 
-    placeholder="https://myreadingmanga.info/slug-truyen/..."
+    placeholder="https://myreadingmanga.info/sakumoto-ayu-big-cat-love-eng/"
 )
-
-with st.expander("⚙️ Cấu hình Vượt Cloudflare (Bắt buộc nếu bị chặn)"):
-    ua_input = st.text_input(
-        "👉 Nhập User-Agent trình duyệt của bạn:",
-        placeholder="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)... (Lấy từ DevTools)",
-        help="Phải là User-Agent của đúng trình duyệt bạn đã dùng để lấy Cookie."
-    )
-    cookie_input = st.text_area(
-        "👉 Nhập Header Cookie đầy đủ:", 
-        placeholder="cf_clearance=...; các giá trị cookie khác...",
-        help="F12 -> Thẻ Network -> F5 lại web -> Bấm vào request đầu tiên -> Copy toàn bộ chuỗi ở mục Cookie."
-    )
 
 if st.button("🚀 Bắt đầu Quét & Tải", type="primary"):
     if not url_input or "http" not in url_input:
         st.warning("Vui lòng nhập đường link bài viết hợp lệ!")
     else:
-        st.info("Đang bóc tách dữ liệu...")
-        
-        images, comic_title, logs = fetch_mrm_images(url_input, cookie_input, ua_input)
+        st.info("Đang tự động vượt Cloudflare và quét toàn bộ danh sách ảnh...")
 
-        with st.expander("🔍 Xem Log tiến trình", expanded=False):
+        images, comic_title, logs = fetch_mrm_images(url_input)
+
+        with st.expander("🔍 Chi tiết Log kết nối", expanded=False):
             for l in logs:
                 st.write(l)
 
         if not images:
-            st.error("Không lấy được ảnh! Hãy kiểm tra tab 'Log tiến trình' ở trên để xem website trả về lỗi gì.")
+            st.error("Không lấy được dữ liệu! Vui lòng kiểm tra Log kết nối.")
         else:
-            st.success(f"Tìm thấy {len(images)} ảnh! Đang tải về và nén...")
+            st.success(f"Tìm thấy {len(images)} ảnh! Đang gom và nén ZIP...")
 
             zip_buffer = io.BytesIO()
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            session_down = cureq.Session(impersonate="chrome124")
-            down_headers = {
-                "Referer": url_input,
-                "User-Agent": ua_input.strip() if ua_input.strip() else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            }
-            if cookie_input.strip():
-                down_headers["Cookie"] = cookie_input.strip()
+            down_scraper = create_scraper_session()
 
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                 for idx, img_url in enumerate(images, 1):
@@ -182,7 +155,7 @@ if st.button("🚀 Bắt đầu Quét & Tải", type="primary"):
                     fname = f"{str(idx).zfill(4)}.{ext}"
 
                     try:
-                        r = session_down.get(img_url, headers=down_headers, timeout=30)
+                        r = down_scraper.get(img_url, headers={"Referer": url_input}, timeout=30)
                         if r.status_code == 200:
                             zip_file.writestr(fname, r.content)
                     except Exception:
